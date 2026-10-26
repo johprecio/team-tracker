@@ -1,0 +1,176 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Team Tracker</title>
+<style>
+:root{--bg:#f3f5f7;--card:#fff;--ink:#1c2733;--mute:#66758a;--line:#d8dee6;--accent:#0f6b6b;--err:#b3261e}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--ink);font:16px/1.5 "Segoe UI",system-ui,sans-serif}
+.wrap{max-width:720px;margin:0 auto;padding:16px}
+header{display:flex;align-items:center;gap:12px;justify-content:space-between;padding:8px 0 16px}
+h1{font-size:1.4rem;margin:0}
+h2{font-size:1.05rem;margin:0 0 12px}
+.card{background:var(--card);border:1px solid var(--line);border-radius:8px;padding:16px;margin-bottom:16px}
+label{display:block;font-size:.85rem;color:var(--mute);margin:10px 0 4px}
+input,select,textarea{width:100%;padding:10px;border:1px solid var(--line);border-radius:6px;font:inherit;background:#fff;color:var(--ink)}
+.row{display:grid;grid-template-columns:1fr 1fr;gap:12px}
+button{background:var(--accent);color:#fff;border:0;border-radius:6px;padding:10px 16px;font:inherit;font-weight:600;cursor:pointer}
+button.ghost{background:none;color:var(--accent);border:1px solid var(--accent)}
+button:disabled{opacity:.5;cursor:wait}
+button:focus-visible,input:focus-visible,select:focus-visible,textarea:focus-visible{outline:3px solid #7fc4c4;outline-offset:1px}
+#msg{margin-top:12px;min-height:1.4em;font-size:.9rem}
+#msg.err{color:var(--err)}
+.entry{padding:10px 0;border-top:1px solid var(--line)}
+.entry:first-child{border-top:0}
+.entry small{color:var(--mute)}
+[hidden]{display:none!important}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <h1>Team Tracker</h1>
+    <div><span id="who"></span> <button id="out" class="ghost" hidden>Sign out</button></div>
+  </header>
+
+  <section id="login" class="card">
+    <h2>Sign in</h2>
+    <p>Use your Microsoft 365 work account. Your entries are saved to your own Excel file.</p>
+    <button id="in">Sign in with Microsoft</button>
+    <div id="loginmsg" class="err"></div>
+  </section>
+
+  <section id="app" hidden>
+    <form id="f" class="card">
+      <h2>New entry</h2>
+      <div class="row">
+        <div><label for="date">Date</label><input id="date" type="date" required></div>
+        <div><label for="status">Status</label>
+          <select id="status"><option>Not started</option><option selected>In progress</option><option>Done</option><option>Blocked</option></select></div>
+      </div>
+      <label for="task">Task</label><input id="task" required maxlength="200">
+      <div class="row">
+        <div><label for="hours">Hours</label><input id="hours" type="number" min="0" step="0.25" value="1"></div>
+        <div></div>
+      </div>
+      <label for="notes">Notes</label><textarea id="notes" rows="2"></textarea>
+      <p><button id="save" type="submit">Save entry</button></p>
+      <div id="msg" role="status"></div>
+    </form>
+    <div class="card"><h2>Your latest entries</h2><div id="list">Loading…</div></div>
+  </section>
+</div>
+
+<script src="https://cdn.jsdelivr.net/npm/@azure/msal-browser@2.38.3/lib/msal-browser.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
+<script>
+// ====== SETTINGS: edit these ======
+const CONFIG = {
+  clientId: "PASTE-YOUR-APP-CLIENT-ID",
+  tenant: "organizations",   // or your tenant ID / domain
+  folderLink: "",            // optional: sharing link of a shared OneDrive/SharePoint folder (everyone needs edit access)
+  folderName: "TeamTracker"  // used only when folderLink is empty (folder in each person's own OneDrive)
+};
+// ==================================
+const HEAD = ["Date","User","Task","Status","Hours","Notes"];
+const SCOPES = CONFIG.folderLink ? ["User.Read","Files.ReadWrite.All"] : ["User.Read","Files.ReadWrite"];
+const $ = id => document.getElementById(id);
+const msal_ = new msal.PublicClientApplication({
+  auth:{clientId:CONFIG.clientId,authority:"https://login.microsoftonline.com/"+CONFIG.tenant,redirectUri:location.origin+location.pathname},
+  cache:{cacheLocation:"localStorage"}
+});
+let me, base;
+
+async function token(){
+  const account = msal_.getActiveAccount();
+  try { return (await msal_.acquireTokenSilent({scopes:SCOPES,account})).accessToken; }
+  catch(e){ return (await msal_.acquireTokenPopup({scopes:SCOPES})).accessToken; }
+}
+async function g(path, opt={}){
+  const t = await token();
+  const r = await fetch("https://graph.microsoft.com/v1.0"+path,{...opt,headers:{Authorization:"Bearer "+t,...(opt.headers||{})}});
+  if(!r.ok){ const e = new Error(await r.text()); e.status = r.status; throw e; }
+  return (r.headers.get("content-type")||"").includes("json") ? r.json() : null;
+}
+const J = {"Content-Type":"application/json"};
+
+async function getBase(){
+  if(base) return base;
+  const file = me.displayName.replace(/[\\/:*?"<>|#%]/g,"").trim() + ".xlsx";
+  if(CONFIG.folderLink){
+    const id = "u!" + btoa(CONFIG.folderLink).replace(/=+$/,"").replace(/\//g,"_").replace(/\+/g,"-");
+    const f = await g(`/shares/${id}/driveItem?$select=id,parentReference`);
+    base = `/drives/${f.parentReference.driveId}/items/${f.id}:/${file}`;
+  } else base = `/me/drive/root:/${CONFIG.folderName}/${file}`;
+  return base;
+}
+
+// Creates the user's workbook + "Transactions" table on first use
+async function ensure(){
+  const b = await getBase();
+  let exists = true;
+  try { await g(b); } catch(e){ if(e.status===404) exists=false; else throw e; }
+  if(exists){
+    try { await g(`${b}:/workbook/tables/Transactions`); return; }
+    catch(e){ if(e.status===404) throw new Error("Your Excel file exists but has no table named 'Transactions'. Add one (Insert > Table) with columns: "+HEAD.join(", ")); throw e; }
+  }
+  const wb = XLSX.utils.book_new();
+  XLSX.utils.book_append_sheet(wb, XLSX.utils.aoa_to_sheet([HEAD]), "Sheet1");
+  const buf = XLSX.write(wb,{type:"array",bookType:"xlsx"});
+  await g(`${b}:/content`,{method:"PUT",headers:{"Content-Type":"application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"},body:buf});
+  const t = await g(`${b}:/workbook/tables/add`,{method:"POST",headers:J,body:JSON.stringify({address:"Sheet1!A1:F1",hasHeaders:true})});
+  await g(`${b}:/workbook/tables/${encodeURIComponent(t.id)}`,{method:"PATCH",headers:J,body:JSON.stringify({name:"Transactions"})});
+}
+
+async function load(){
+  const list = $("list");
+  try {
+    const b = await getBase();
+    const d = await g(`${b}:/workbook/tables/Transactions/rows`);
+    const rows = d.value.map(r=>r.values[0]).slice(-8).reverse();
+    list.textContent = "";
+    if(!rows.length){ list.textContent = "No entries yet. Add your first one above."; return; }
+    rows.forEach(v=>{
+      const e = document.createElement("div"); e.className="entry";
+      const s = document.createElement("strong"); s.textContent = v[2];
+      const m = document.createElement("small"); m.textContent = ` ${v[0]} · ${v[3]} · ${v[4]}h` + (v[5]?` · ${v[5]}`:"");
+      e.append(s,m); list.append(e);
+    });
+  } catch(e){ list.textContent = "Nothing saved yet."; }
+}
+
+$("f").addEventListener("submit", async ev=>{
+  ev.preventDefault();
+  const btn=$("save"), msg=$("msg"); btn.disabled=true; msg.className=""; msg.textContent="Saving…";
+  try {
+    await ensure();
+    const row = [$("date").value, me.displayName, $("task").value.trim(), $("status").value, Number($("hours").value)||0, $("notes").value.trim()];
+    await g(`${await getBase()}:/workbook/tables/Transactions/rows/add`,{method:"POST",headers:J,body:JSON.stringify({values:[row]})});
+    msg.textContent = "Saved to your Excel file.";
+    $("task").value=""; $("notes").value="";
+    load();
+  } catch(e){ msg.className="err"; msg.textContent = "Could not save: " + (e.message||e).slice(0,300); }
+  btn.disabled=false;
+});
+
+async function start(){
+  me = await g("/me?$select=displayName");
+  $("who").textContent = me.displayName;
+  $("login").hidden = true; $("app").hidden = false; $("out").hidden = false;
+  $("date").value = new Date().toISOString().slice(0,10);
+  load();
+}
+$("in").onclick = async ()=>{
+  try {
+    const r = await msal_.loginPopup({scopes:SCOPES});
+    msal_.setActiveAccount(r.account); await start();
+  } catch(e){ $("loginmsg").textContent = "Sign-in failed: " + (e.message||e); }
+};
+$("out").onclick = ()=> msal_.logoutPopup().then(()=>location.reload());
+const acc = msal_.getAllAccounts()[0];
+if(acc){ msal_.setActiveAccount(acc); start().catch(e=>{$("loginmsg").textContent=String(e.message||e)}); }
+</script>
+</body>
+</html>
